@@ -54,6 +54,7 @@ from kiro_crew.acp.liveness import (
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_EXTERNAL,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
@@ -2098,6 +2099,7 @@ class AcpClient:
         channel_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
+        acp_command: list[str] | None = None,
         audit_source: str | None = None,
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_settings_mcp_json: str | Path | None = None,
@@ -2120,6 +2122,10 @@ class AcpClient:
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        # Launch argv for an operator-declared harness (ACP_BACKEND_EXTERNAL).
+        # Empty for every built-in, whose binary this module resolves itself —
+        # so a stray value can never redirect the kiro-cli spawn.
+        self._acp_command: list[str] = list(acp_command or [])
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
         # that drives the _is_claude seam reads/writes it and wires the
@@ -2310,6 +2316,17 @@ class AcpClient:
     @property
     def _is_claude(self) -> bool:
         return self.backend == ACP_BACKEND_CLAUDE
+
+    @property
+    def _is_external(self) -> bool:
+        """True when this client drives an operator-declared ACP harness.
+
+        Kept separate from ``_is_kiro`` deliberately: the kiro path resolves a
+        binary it knows by name, materializes an agent file for it, and defers to
+        its internal sandbox. None of that is true of a harness Kiro Crew has
+        never seen, so the two must not share a branch.
+        """
+        return self.backend == ACP_BACKEND_EXTERNAL
 
     @property
     def _is_kiro(self) -> bool:
@@ -2757,6 +2774,43 @@ class AcpClient:
                     f"script."
                 )
             argv: list[str] = claude_argv
+        elif self._is_external:
+            # An operator-declared harness: the argv came from config and is the
+            # only thing that can start it. Deliberately absent here, unlike the
+            # kiro branch below:
+            #   * no binary resolution — there is no name to search for;
+            #   * no ensure_agent_materialized — ~/.kiro/agents/ is kiro-cli's
+            #     agent format, and writing it for a foreign harness would imply
+            #     a contract neither side has agreed to. The harness receives the
+            #     agent name in its argv (the {agent} placeholder) and decides
+            #     for itself what that means.
+            # The executable check is worth its syscall: without it a typo'd
+            # command surfaces as an opaque spawn failure mid-session. It reuses
+            # the prerequisite's own predicate rather than restating the rule —
+            # three spellings of "may ACP launch this file?" is how they drift
+            # (First Principles review on this PR). The path is already absolute
+            # and realpath-resolved by ``resolve_acp_interface``, so the file
+            # checked here is the file exec'd below; nothing re-resolves it
+            # against this process's cwd.
+            if not self._acp_command:
+                raise AcpError(
+                    "external ACP interface has no launch command; "
+                    "set acp_interfaces.<name>.command"
+                )
+            exe = self._acp_command[0]
+            # Deferred for the same reason as the import at ``_resolve_kiro_bin``
+            # above: kiro_prerequisite imports sandbox helpers this module also
+            # uses, so a module-scope import is circular.
+            from kiro_crew.kiro_prerequisite import _acp_executable_is_runnable
+
+            if not await asyncio.to_thread(
+                functools.partial(_acp_executable_is_runnable, exe, platform_name=sys.platform)
+            ):
+                raise AcpError(
+                    f"ACP interface command is not an executable file: {exe!r}. "
+                    f"Check acp_interfaces.<name>.command."
+                )
+            argv = list(self._acp_command)
         else:
             try:
                 kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -2915,7 +2969,13 @@ class AcpClient:
         )
         self._pid = self._process.pid
         _spawn_label = (
-            "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            "claude-agent-acp"
+            if self._is_claude
+            else (
+                os.path.basename(self._acp_command[0])
+                if self._is_external and self._acp_command
+                else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            )
         )
         # Everything from here to the end of _spawn runs with a LIVE subprocess
         # that nothing has recorded yet, so every step must be guarded. Without
@@ -3044,7 +3104,15 @@ class AcpClient:
             self._stderr_lines.append(text)
             redacted, _ = redact_exfiltration_urls(text)
             redacted, _ = redact_credentials(redacted)
-            _bin_label = "claude-acp" if self._is_claude else KIRO_CLI_BIN
+            _bin_label = (
+                "claude-acp"
+                if self._is_claude
+                else (
+                    os.path.basename(self._acp_command[0])
+                    if self._is_external and self._acp_command
+                    else KIRO_CLI_BIN
+                )
+            )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
             # Flush the residual count once the stream closes so the final burst

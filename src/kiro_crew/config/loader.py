@@ -1616,7 +1616,8 @@ class AgentConfig:
         metadata=_meta(
             "ACP Backend",
             "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
-            "KAS runs chat but has no native subagent progress reporting yet.",
+            "KAS runs but has no native subagent progress reporting yet. A crew's "
+            "own acp_interface takes precedence over this.",
             enum=["", "kas"],
         ),
     )
@@ -3527,6 +3528,17 @@ class KiroCrewAgentConfig:
         default="",
         metadata=_meta("Description", "Human-readable agent description."),
     )
+    acp_interface: str = field(
+        default="",
+        metadata=_meta(
+            "ACP Interface",
+            "Which ACP harness runs this crew: a name from the acp_interfaces "
+            "section, or the built-in 'kiro-cli' / 'kas'. Empty inherits the "
+            "global agent.acp_interface, which itself defaults to kiro-cli — so "
+            "an install that configures none of this is unchanged. This is what "
+            "makes a crew local or remote.",
+        ),
+    )
     triggers: str = field(
         default="",
         metadata=_meta(
@@ -3582,6 +3594,47 @@ class WorkspaceConfig:
     dir: str = field(
         default="workspace",
         metadata=_meta("Directory", "Workspace directory path."),
+    )
+
+
+@dataclass
+class AcpInterfaceConfig:
+    """An operator-declared ACP harness a crew can be bound to.
+
+    The built-in ``kiro-cli`` and ``kas`` interfaces need no entry here; this
+    section exists to name ADDITIONAL harnesses — a local model behind an ACP
+    shim, a second vendor's agent binary — so a crew can select one by name.
+    Everything an external harness needs to launch is declared here, because the
+    spawn path knows how to find kiro-cli and nothing else.
+    """
+
+    command: str = field(
+        default="",
+        metadata=_meta(
+            "Command",
+            "Absolute path to the ACP backend executable. Required, and required "
+            "to be absolute: an interface with no command, or a relative one, is "
+            "refused at load, because the alternative is a crew that fails on its "
+            "first message instead of at startup.",
+        ),
+    )
+    args: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Arguments",
+            "Argv after the command. Supports {agent} (the kiro agent / modeId) "
+            "and {model} placeholders. Empty means the kiro-cli convention: "
+            "['acp', '--agent', '{agent}'].",
+        ),
+    )
+    env: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Environment",
+            "Extra environment for the backend process, merged over the "
+            "inherited environment. Kiro's own API key is never passed to an "
+            "external harness regardless of what is set here.",
+        ),
     )
 
 
@@ -4616,6 +4669,175 @@ def _normalize_jail(value: object) -> str:
     if isinstance(value, str) and value in _VALID_JAIL_MODES:
         return value
     return JAIL_MODE_AUTO
+
+
+def _parse_acp_interfaces(raw: object) -> dict[str, "AcpInterfaceConfig"]:
+    """Build the ``acp_interfaces`` map, dropping entries that cannot launch.
+
+    Two things are refused rather than accepted-and-warned-about later:
+
+    * an entry with no ``command`` — the failure would otherwise surface as a
+      dead session on the operator's first message to that crew, far from the
+      config line that caused it;
+    * an entry named after a BUILT-IN interface — allowing it would let a
+      redefined ``kiro-cli`` silently move every unconfigured crew onto an
+      operator-supplied command, which is the one substitution nobody asked for.
+
+    A dropped entry leaves its crews falling back to kiro-cli, which is the
+    behaviour they had before the entry existed.
+    """
+    from kiro_crew.acp.types import ACP_BUILTIN_INTERFACES
+
+    result: dict[str, AcpInterfaceConfig] = {}
+    if not isinstance(raw, dict):
+        return result
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if name in ACP_BUILTIN_INTERFACES:
+            logger.warning(
+                "Ignoring acp_interfaces[%r]: that name is built in and cannot be "
+                "redefined. Rename the interface to bind crews to it.",
+                name,
+            )
+            continue
+        if not isinstance(entry, dict):
+            continue
+        command = entry.get("command", "")
+        if not isinstance(command, str) or not command.strip():
+            logger.warning(
+                "Ignoring acp_interfaces[%r]: no 'command'. Crews bound to it "
+                "will fall back to the default interface.",
+                name,
+            )
+            continue
+        if not os.path.isabs(os.path.expanduser(command.strip())):
+            # A relative command is ambiguous by construction: it would resolve
+            # against the gateway's cwd when validated and against the session
+            # work dir when spawned, and that work dir is workspace-controlled.
+            # Refusing here is what makes "the path checked is the path run"
+            # true, rather than relying on both sites agreeing.
+            logger.warning(
+                "Ignoring acp_interfaces[%r]: 'command' must be an absolute path, "
+                "got %r. A relative command resolves differently when validated "
+                "than when spawned.",
+                name,
+                command,
+            )
+            continue
+        raw_args = entry.get("args", [])
+        args = [a for a in raw_args if isinstance(a, str)] if isinstance(raw_args, list) else []
+        raw_env = entry.get("env", {})
+        env = (
+            {k: v for k, v in raw_env.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(raw_env, dict)
+            else {}
+        )
+        result[name] = AcpInterfaceConfig(
+            command=command.strip(),
+            args=args,
+            env=env,
+        )
+    return result
+
+
+@dataclass
+class ResolvedAcpInterface:
+    """The launch decision for one session: which harness, and how to start it.
+
+    ``command`` is empty for a built-in, whose binary the spawn path resolves
+    itself; it is populated only for an external harness, where config is the
+    only place the argv can come from.
+    """
+
+    name: str
+    backend: str
+    command: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+def resolve_acp_interface(
+    config: "KiroCrewConfig",
+    crew_agent: str | None = None,
+    kiro_agent: str | None = None,
+    model: str | None = None,
+) -> ResolvedAcpInterface:
+    """Resolve which ACP harness runs this session, highest tier first.
+
+    1. the crew's own ``acp_interface``
+    2. ``agent.acp_backend`` — the pre-interface setting, honoured so an install
+       that persisted ``kas`` there keeps running KAS without being re-configured
+    3. the built-in kiro-cli
+
+    There is deliberately no global ``agent.acp_interface`` tier. The mixed-fleet
+    case this feature exists for is served entirely by the per-crew key, and the
+    every-crew case by tier 2, so a third tier would add a resolution step no
+    caller needs (First Principles review on this PR).
+
+    An unknown name degrades to the default with a warning rather than raising:
+    the alternative is a gateway that will not answer, and a typo in one crew's
+    binding must not take the install down.
+    """
+    from kiro_crew.acp.types import (
+        ACP_BACKEND_EXTERNAL,
+        ACP_BACKEND_KAS,
+        ACP_BUILTIN_INTERFACES,
+        ACP_INTERFACE_DEFAULT,
+        ACP_INTERFACE_KAS,
+    )
+
+    requested = ""
+    crew_cfg = config.agents.get(crew_agent or "")
+    if crew_cfg is not None and crew_cfg.acp_interface.strip():
+        requested = crew_cfg.acp_interface.strip()
+    elif config.agent.acp_backend == ACP_BACKEND_KAS:
+        requested = ACP_INTERFACE_KAS
+
+    if not requested:
+        requested = ACP_INTERFACE_DEFAULT
+
+    if requested in ACP_BUILTIN_INTERFACES:
+        return ResolvedAcpInterface(name=requested, backend=ACP_BUILTIN_INTERFACES[requested])
+
+    iface = config.acp_interfaces.get(requested)
+    if iface is None:
+        logger.warning(
+            "Unknown acp_interface %r (crew=%r); using %r. Declared interfaces: %s",
+            requested,
+            crew_agent or "",
+            ACP_INTERFACE_DEFAULT,
+            ", ".join(sorted(config.acp_interfaces)) or "(none)",
+        )
+        return ResolvedAcpInterface(
+            name=ACP_INTERFACE_DEFAULT,
+            backend=ACP_BUILTIN_INTERFACES[ACP_INTERFACE_DEFAULT],
+        )
+
+    args = iface.args or ["acp", "--agent", "{agent}"]
+    subs = {"agent": kiro_agent or "", "model": model or ""}
+    rendered: list[str] = []
+    for arg in args:
+        try:
+            rendered.append(arg.format(**subs))
+        except (KeyError, IndexError, ValueError):
+            # An unknown placeholder is the operator's typo, not a reason to
+            # refuse the launch: pass the argument through verbatim so the
+            # harness reports it rather than the gateway swallowing the session.
+            rendered.append(arg)
+    # Resolve to a canonical absolute path HERE, once, so the path that gets
+    # validated is the path that gets executed. A relative command would
+    # otherwise resolve against the gateway's cwd when checked and against the
+    # session work dir when spawned — and that work dir is workspace-controlled,
+    # so the two could name different files and a workspace-supplied executable
+    # would run (GPT review on this PR). ``_parse_acp_interfaces`` already
+    # refuses a non-absolute command; this is the second half of the same
+    # invariant, kept here because this is what builds the argv.
+    return ResolvedAcpInterface(
+        name=requested,
+        backend=ACP_BACKEND_EXTERNAL,
+        command=[os.path.realpath(os.path.expanduser(iface.command)), *rendered],
+        env=dict(iface.env),
+    )
 
 
 def _normalize_acp_backend(value: object) -> str:
@@ -6923,6 +7145,15 @@ class KiroCrewConfig:
         default_factory=dict,
         metadata=_meta("Agents", "Named Kiro Crew agent definitions."),
     )
+    acp_interfaces: dict[str, AcpInterfaceConfig] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "ACP Interfaces",
+            "Additional ACP harnesses crews may be bound to. The built-in "
+            "'kiro-cli' and 'kas' interfaces are always available and need no "
+            "entry here.",
+        ),
+    )
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Active Kiro Crew agent name from the agents section."),
@@ -7305,6 +7536,11 @@ class KiroCrewConfig:
                         memory_store=entry.get("memory_store", "default"),
                         model=raw_model if isinstance(raw_model, str) else "",
                         description=entry.get("description", ""),
+                        acp_interface=(
+                            entry["acp_interface"]
+                            if isinstance(entry.get("acp_interface"), str)
+                            else ""
+                        ),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
                         # Same guard family as model/triggers: config.json is
@@ -7339,6 +7575,8 @@ class KiroCrewConfig:
                     )
         if not memory_stores:
             memory_stores["default"] = MemoryStoreConfig()
+
+        acp_interfaces = _parse_acp_interfaces(data.get("acp_interfaces", {}))
 
         # Parse top-level default_agent and default_memory_store
         default_agent_val = data.get("default_agent", "")
@@ -7964,6 +8202,7 @@ class KiroCrewConfig:
             hooks=data.get("hooks", {}),
             agents=agents,
             default_agent=default_agent_val,
+            acp_interfaces=acp_interfaces,
             workspaces=workspaces,
             default_workspace=data.get("default_workspace", "default"),
             memory_stores=memory_stores,
@@ -8725,6 +8964,16 @@ class KiroCrewConfig:
                         session_key or "?",
                         m or "auto",
                     )
+            # Which ACP harness serves THIS session. Resolved per call rather
+            # than captured at factory-build time because it is a per-crew
+            # decision: one gateway runs a local crew and a kiro-cli crew at the
+            # same time, so a value closed over once would bind them together.
+            iface = resolve_acp_interface(self, crew_agent, kiro_agent=agent, model=m)
+            # An external harness gets the interface's env; a built-in must not,
+            # so a stray entry cannot alter how kiro-cli is launched.
+            _env = extra_env
+            if iface.env:
+                _env = {**(extra_env or {}), **iface.env}
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -8733,8 +8982,10 @@ class KiroCrewConfig:
                 sandbox_mode=sandbox,
                 session_key=session_key,
                 channel_id=channel_id,
-                extra_env=extra_env,
-                acp_backend=self.agent.acp_backend,
+                extra_env=_env,
+                acp_backend=iface.backend,
+                acp_command=iface.command or None,
+                acp_interface=iface.name,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
                 tool_search_min_pct=tool_search_min_pct,

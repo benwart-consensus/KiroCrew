@@ -97,7 +97,7 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - `is_alive()` → `AcpClient.is_responsive()` (600s stale threshold)
 - `is_process_alive()` → OS-level process check
 
-**Reasoning effort** (Opus/Sonnet/Fable **and GPT-5.x** — shared vocabulary in `effort.py`: levels `low|medium|high|xhigh|max`, capability via `model_supports_effort`, resolution via `resolve_effort_for_model` with priority slot-override > workspace default > None). Capability is a conservative allowlist of known-capable families (`opus`/`sonnet`/`fable`/`gpt`, minus a hard `haiku` exclusion), verified against kiro-cli 2.12/2.13 over ACP — kiro rejects `/effort` on the other third-party models (deepseek/minimax/glm/qwen/auto) with "Effort configuration is currently not available on <model>". A new model family lands as unsupported until confirmed (safe default: the slider hides). Applied via a workspace `cli.json` overlay at `<work_dir>/.kiro/settings/cli.json` → `chat.modelDefaults.<model>.<key>.effort`, written before every spawn (`_write_cli_overlay`) and recovered on init (`_read_cli_overlay`) for server-restart resilience. The `<key>` sub-object is **family-specific** (`effort_settings_key`): `output_config` for Claude models, `reasoning` for GPT models — kiro silently ignores the wrong key, so a mismatched shape would survive a live push but drop on respawn. `_write_cli_overlay` removes stale effort from the other family key while preserving unrelated settings; `_clear_cli_overlay_effort`/`_read_cli_overlay` sweep both keys. Live change pushes `/effort` with the TuiCommand args form (`send_command(args={"level": …})`). The factory threads `reasoning_effort_override` → `effort_per_model[current_model]`; when a valid requested effort cannot be threaded (the resolved model is empty or not effort-capable) the factory's gate logs one warning naming the level, the session, and the resolved model (or `auto` when unresolved, matching the spawn-side `effort_dropped` verdict) — the single drop authority reporting its own decision, covering every surface (spawn, dashboard slot, cron) that funnels through it, an explicit `reasoning_effort_override` always warns (a caller's own dropped request is the event the gate exists to surface), while a drop sourced only from the config default (`agent.reasoning_effort`) is deduped once per (model, level) for the factory's lifetime so one static configuration fact does not repeat on every construction. A `reasoning_effort_override` also bypasses the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh factory call to be delivered at all. The dashboard handler routes through `change_effort`/`clear_effort` and only resets the session when there is no live provider. Non-effort-capable models persist the slot value without a live apply or reset.
+**Reasoning effort** (Opus/Sonnet/Fable **and GPT-5.x** — shared vocabulary in `effort.py`: levels `low|medium|high|xhigh|max`, capability via `model_supports_effort`, resolution via `resolve_effort_for_model` with priority slot-override > workspace default > None). Capability is a conservative allowlist of known-capable families (`opus`/`sonnet`/`fable`/`gpt`, minus a hard `haiku` exclusion), verified against kiro-cli 2.12/2.13 over ACP — kiro rejects `/effort` on the other third-party models (deepseek/minimax/glm/qwen/auto) with "Effort configuration is currently not available on <model>". A new model family lands as unsupported until confirmed (safe default: the slider hides). Applied via a workspace `cli.json` overlay at `<work_dir>/.kiro/settings/cli.json` → `chat.modelDefaults.<model>.<key>.effort`, written before every spawn (`_write_cli_overlay`) and recovered on init (`_read_cli_overlay`) for server-restart resilience. The `<key>` sub-object is **family-specific** (`effort_settings_key`): `output_config` for Claude models, `reasoning` for GPT models — kiro silently ignores the wrong key, so a mismatched shape would survive a live push but drop on respawn. `_write_cli_overlay` removes stale effort from the other family key while preserving unrelated settings; `_clear_cli_overlay_effort`/`_read_cli_overlay` sweep both keys. Live change pushes `/effort` with the TuiCommand args form (`send_command(args={"level": …})`). The factory threads `reasoning_effort_override` → `effort_per_model[current_model]`; when a valid requested effort cannot be threaded (the resolved model is empty or not effort-capable) the factory's gate logs one warning naming the level, the session, and the resolved model (or `auto` when unresolved, matching the spawn-side `effort_dropped` verdict) — the single drop authority reporting its own decision, covering every surface (spawn, dashboard slot, cron) that funnels through it, an explicit `reasoning_effort_override` always warns (a caller's own dropped request is the event the gate exists to surface), while a drop sourced only from the config default (`agent.reasoning_effort`) is deduped once per (model, level) for the factory's lifetime so one static configuration fact does not repeat on every construction. A `reasoning_effort_override` also bypasses the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh factory call to be delivered at all. A crew bound to a different ACP interface than the pool's bypasses it the same way (`bypass_interface`): the pool is filled with no crew identity and `_claim_from_pool` matches only the *kiro agent* name, so two crews sharing one `kiro_agent` while binding different `acp_interface` values could otherwise be handed each other's provider and have their prompts served by a harness the operator did not choose — silently, since nothing fails. It fails closed: any error comparing the two interfaces bypasses the pool, because a needless cold start costs latency while a wrong claim costs correctness. The dashboard handler routes through `change_effort`/`clear_effort` and only resets the session when there is no live provider. Non-effort-capable models persist the slot value without a live apply or reset.
 
 **MCP Tool Search** (kiro backend only — see https://kiro.dev/docs/cli/mcp/tool-search/): loads MCP tool specs on demand ("search-and-call") instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. Gated by the `agent.tool_search` config toggle (default **on**; auto-surfaces as a Settings toggle since the schema is generated from the dataclass).
 - Applied via the **same** workspace `cli.json` overlay used for effort (`<work_dir>/.kiro/settings/cli.json`), written deterministically before every spawn and on each restart by `_write_tool_search_overlay` (called from `AcpProvider.__init__` and `start()`). When enabled it writes the flat keys `toolSearch.enabled=true` plus `toolSearch.minPct`/`toolSearch.minTokens`, taken from `agent.tool_search_min_pct` / `agent.tool_search_min_tokens` (defaults `5` / `50000`, mirroring kiro-cli's own thresholds; clamped to 0-100 and >= 0, non-numeric falls back to the default); when disabled it writes `toolSearch.enabled=false` and drops both thresholds.
@@ -178,7 +178,9 @@ enters the same `AcpRuntime.spawn()` cold-start coordinator (default 2 concurren
 spawn+initialize handshakes per gateway loop); admission is backend-neutral, so an
 adapted runtime harness neither bypasses the bound nor changes the Kiro path.
 
-- **kiro (`is_claude_backend` False)** → `_start_kiro_runtime()`. This spawns an
+- **Kiro family (`is_acp_runtime_backend` — membership in
+  `ACP_BACKENDS_ACP_RUNTIME`: `kiro-cli` and KAS)** → `_start_kiro_runtime()`.
+  This spawns an
   `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
   overlay/socket), resumes via `runtime.load_session()` when a prior transcript
   exists or otherwise `runtime.create_session()`, applies the configured model,
@@ -186,7 +188,24 @@ adapted runtime harness neither bypasses the bound nor changes the Kiro path.
   same interface as `AcpClient`, so downstream callers are unchanged). Any
   failure after `spawn()` kills the runtime so a half-initialised session never
   leaks an orphaned `kiro-cli`.
-- **Alternate ACP backend (`is_claude_backend` True)** → legacy `AcpClient.ensure_ready()`.
+- **Everything else (the dormant claude seam, and `ACP_BACKEND_EXTERNAL`)** →
+  legacy `AcpClient.ensure_ready()`, one process per session.
+
+This branch reads as **positive membership**, not `not is_claude_backend`. The
+distinction was invisible while claude was the only non-Kiro-family backend and
+became load-bearing the moment a fourth arrived: an external harness is neither
+Kiro-family nor claude, so the old spelling would have sent it down the Kiro
+runtime path. Three sibling sites carried the same latent defect and were
+converted with it (harness-parity H5):
+
+| Site | Was | Now | Why it matters |
+|---|---|---|---|
+| `_apply_effort_overlay` | `not is_claude_backend` | `is_acp_runtime_backend` | writes kiro-cli's own `cli.json`; a foreign harness would be handed a settings file it never reads |
+| `_apply_tool_search_overlay` | `not is_claude_backend` | `is_acp_runtime_backend` | same file, same reason — Tool Search is a kiro-cli feature |
+| `change_effort` | `not is_claude_backend` → `/effort` | `is_external_backend` reports unsupported | `/effort` is a kiro-cli slash command and `set_config_option` is claude's; an external harness has neither, so the control reports unsupported instead of faulting the session mid-turn |
+
+The conversions are behaviour-identical for `kiro-cli`, KAS and claude; they only
+change what a backend added *later* inherits, which is the whole point.
 
 `AcpProvider.is_session_sharing_eligible` is membership in
 `ACP_BACKENDS_SESSION_SHARING` (harness-parity H6), not `not is_claude_backend`:
@@ -194,4 +213,5 @@ a capability granted by the absence of one backend is inherited by every backend
 added later. It is what `SessionManager.is_session_sharing_eligible()` consults
 to decide whether a parent session can host multiplexed subagent sessions. The
 invariants governing what an added harness may and may not change are in
-[harness-parity.md](harness-parity.md).
+[harness-parity.md](harness-parity.md), which also records each registered
+harness's Group B decisions.

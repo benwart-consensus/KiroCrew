@@ -25,8 +25,10 @@ from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_EXTERNAL,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
@@ -39,9 +41,18 @@ from kiro_crew.session import SessionManager
 
 
 def _build_provider(backend: str) -> AcpProvider:
-    """Mirror test_acp_provider's helper: construct without spawning anything."""
+    """Mirror test_acp_provider's helper: construct without spawning anything.
+
+    ``ACP_BACKEND_EXTERNAL`` is defined BY its launch command — the provider
+    refuses to construct without one, because there is no binary it could fall
+    back to resolving — so the parametrized cases over ``ACP_BACKENDS_KNOWN``
+    supply a placeholder. Nothing is spawned here; ``AcpClient`` is patched out.
+    """
+    kwargs: dict = {"acp_backend": backend}
+    if backend == ACP_BACKEND_EXTERNAL:
+        kwargs["acp_command"] = ["/nonexistent/harness", "acp"]
     with patch("kiro_crew.providers.acp.AcpClient"):
-        provider = AcpProvider(acp_backend=backend)
+        provider = AcpProvider(**kwargs)
     provider._client = MagicMock()
     provider._client.backend = backend
     return provider
@@ -71,6 +82,15 @@ class TestBackendPredicates:
         assert provider.is_kas_backend is False
         assert provider.is_acp_runtime_backend is False
 
+    def test_external_backend(self):
+        provider = _build_provider(ACP_BACKEND_EXTERNAL)
+        assert provider.is_external_backend is True
+        assert provider.is_kiro_backend is False
+        assert provider.is_kas_backend is False
+        assert provider.is_claude_backend is False
+        # An operator-declared harness claims no kiro-family capability.
+        assert provider.is_acp_runtime_backend is False
+
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
     def test_exactly_one_predicate_holds_for_every_known_backend(self, backend):
         provider = _build_provider(backend)
@@ -78,16 +98,22 @@ class TestBackendPredicates:
             provider.is_kiro_backend,
             provider.is_claude_backend,
             provider.is_kas_backend,
+            provider.is_external_backend,
         ]
         assert sum(held) == 1
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-    def test_acp_runtime_backend_is_the_positive_form_of_not_claude(self, backend):
-        # The four provider sites that used to read ``not is_claude_backend``
-        # now read ``is_acp_runtime_backend``; the two must stay equivalent for
-        # every known backend so the conversion is behavior-preserving.
+    def test_acp_runtime_backend_is_membership_not_a_negation(self, backend):
+        # This test used to assert ``is_acp_runtime_backend == (not
+        # is_claude_backend)``, which was true only while claude was the ONLY
+        # non-kiro-family backend. ACP_BACKEND_EXTERNAL is neither kiro-family
+        # nor claude, so that equivalence is now false BY DESIGN — and the
+        # equivalence failing is exactly the hazard harness-parity H5 describes:
+        # a capability expressed as the absence of one other harness silently
+        # hands itself to the next one added. The durable invariant is the
+        # membership the property is defined by, so assert that instead.
         provider = _build_provider(backend)
-        assert provider.is_acp_runtime_backend is (not provider.is_claude_backend)
+        assert provider.is_acp_runtime_backend is (backend in ACP_BACKENDS_ACP_RUNTIME)
 
 
 class TestUnknownBackendRejected:

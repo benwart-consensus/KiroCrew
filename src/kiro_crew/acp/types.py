@@ -108,6 +108,14 @@ ACP_CLIENT_CAPABILITIES: dict = {
 
 ACP_BACKEND_CLAUDE = "claude"
 ACP_BACKEND_KAS = "kas"
+# An operator-declared ACP harness, launched from a command in
+# ``acp_interfaces``. Unlike the three ids above it does not name ONE program:
+# it names "some conforming ACP backend whose argv came from config", so the
+# spawn path takes the command from the client rather than resolving a binary it
+# knows by name. One id covers every such harness because nothing here may
+# depend on WHICH one it is — the capability sets below are what a harness earns
+# individually, and an external harness has demonstrated none of them.
+ACP_BACKEND_EXTERNAL = "external"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -119,6 +127,7 @@ ACP_BACKENDS_KNOWN = frozenset(
         ACP_BACKEND_KIRO,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_KAS,
+        ACP_BACKEND_EXTERNAL,
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
@@ -127,6 +136,28 @@ ACP_BACKENDS_KNOWN = frozenset(
 # resolution degrades an unselectable value to the default, so a typo costs a log
 # line rather than a gateway that will not start.
 ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# ── ACP interfaces (named, per-crew selectable harnesses) ──
+# An *interface* is what an operator selects; a *backend* is the protocol dialect
+# the code then speaks. The two are separate because the dialects are a closed
+# set the code must understand, while the interfaces are open: an operator may
+# declare any number of external harnesses, and each needs its own name, command
+# and env without inventing a backend id the code has never heard of.
+#
+# The built-ins below are always present and need no configuration — naming one
+# in ``acp_interfaces`` is refused rather than allowed to shadow it, because a
+# redefined ``kiro-cli`` would silently move every unconfigured crew onto an
+# operator's command.
+ACP_INTERFACE_KIRO_CLI = "kiro-cli"
+ACP_INTERFACE_KAS = "kas"
+ACP_BUILTIN_INTERFACES: dict[str, str] = {
+    ACP_INTERFACE_KIRO_CLI: ACP_BACKEND_KIRO,
+    ACP_INTERFACE_KAS: ACP_BACKEND_KAS,
+}
+# The interface a crew gets when neither it nor the global default names one.
+# kiro-cli remains the zero-config path: an install that never touches any of
+# this behaves exactly as it did before.
+ACP_INTERFACE_DEFAULT = ACP_INTERFACE_KIRO_CLI
 
 # ── Capability membership (harness-parity H6, H7) ──
 # Every capability a backend may claim is an OPT-IN set here, never a negation at
@@ -163,6 +194,12 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # sandbox factory resolves an absent config to its no-op backend, so no OS
 # sandbox starts inside — adding KAS here would skip Crew's seatbelt in favour of
 # a layer that does not exist. See :mod:`kiro_crew.acp.kas_transport`.
+#
+# ACP_BACKEND_EXTERNAL is excluded BY DESIGN and must stay excluded, for the same
+# reason stated positively: an operator-supplied command has demonstrated no
+# internal sandbox, so it is precisely the case that must keep Crew's seatbelt.
+# Adding it here to "fix" a harness that dislikes the sandbox would silently
+# unconfine every external harness on the install.
 ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 
 # Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
@@ -205,6 +242,13 @@ ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
 PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
+# An operator-declared harness needs its OWN label even though one id covers
+# every such harness: without it an external session persists under the kiro
+# label, and the session map then prunes its id for want of a kiro transcript
+# (harness-parity H11). One label for all external harnesses is correct here —
+# the label answers "whose transcript format is this?", and Kiro Crew knows no
+# more about one external harness's session files than another's.
+PROVIDER_LABEL_EXTERNAL = "external"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under

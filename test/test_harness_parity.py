@@ -27,6 +27,7 @@ from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import runtime as acp_runtime
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_EXTERNAL,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
@@ -39,6 +40,7 @@ from kiro_crew.acp.types import (
     KAS_CLIENT_CAPABILITIES,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
+    PROVIDER_LABEL_EXTERNAL,
     PROVIDER_LABEL_KAS,
 )
 from kiro_crew.config.loader import AgentConfig, _normalize_acp_backend
@@ -290,6 +292,7 @@ def test_every_known_backend_has_a_label() -> None:
         ACP_BACKEND_KIRO: PROVIDER_LABEL_DEFAULT,
         ACP_BACKEND_CLAUDE: PROVIDER_LABEL_CLAUDE,
         ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
+        ACP_BACKEND_EXTERNAL: PROVIDER_LABEL_EXTERNAL,
     }
     assert set(labels) == set(ACP_BACKENDS_KNOWN), (
         "a known backend has no PROVIDER_LABEL_* of its own, so it would persist "

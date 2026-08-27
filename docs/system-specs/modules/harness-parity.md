@@ -3,7 +3,9 @@
 A *harness* is the agent process Kiro Crew drives over ACP. Kiro Crew has one
 first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled `""`) — and a
 growing set of adapted ones: the dormant `ACP_BACKEND_CLAUDE` seam, `KAS`
-(`ACP_BACKEND_KAS`), and whatever a bring-your-own (BYO) adapter registers next.
+(`ACP_BACKEND_KAS`), `ACP_BACKEND_EXTERNAL` for a harness an operator declares
+in `acp_interfaces` (see [Registered harnesses](#registered-harnesses)), and
+whatever a bring-your-own (BYO) adapter registers next.
 
 *Parity* here does not mean equal treatment. It means the opposite, stated
 precisely: **an added harness may only adapt itself to the seams the Kiro
@@ -99,6 +101,44 @@ structural invariants (Groups A and C) are pinned by
 in a separate gate. Group D reaches the four AI review lanes through
 `AUTOSDE.yaml`'s `harness-parity` rule, which every lane's prompt treats as the
 source of truth for what blocks.
+
+## Registered harnesses
+
+Item 4 of the checklist below requires an explicit Group B decision per harness.
+This is where those decisions are recorded, so "what did we grant it?" is a
+lookup rather than an archaeology exercise across the capability sets.
+
+### `ACP_BACKEND_EXTERNAL` — operator-declared (`acp_interfaces`)
+
+One identifier covers every such harness, because nothing here may depend on
+*which* one it is: the capability sets below are what a harness earns
+individually, and an operator-supplied command has demonstrated none of them.
+Selected per crew via `agents.<crew>.acp_interface`; the argv comes from
+`acp_interfaces.<name>` and is realpath-resolved before it reaches the client.
+
+| Set | Member | Why |
+|---|---|---|
+| `ACP_BACKENDS_KNOWN` (H8) | yes | `AcpProvider.__init__` must accept it, and must reject it when no launch command was resolved |
+| `ACP_BACKENDS_SELECTABLE` | no | reached by declaring an interface, not by typing a backend id into `agent.acp_backend` |
+| `ACP_BACKENDS_INTERNAL_SANDBOX` (H7) | **no** | the row that fails OPEN. An operator-supplied command has no internal sandbox, so it is exactly the case that must keep Crew's seatbelt; granting it here hands isolation to a layer that never starts |
+| `ACP_BACKENDS_SESSION_SHARING` (H6) | no | nothing establishes that one external process can host N sessions, or persist a shared subagent session across teardown |
+| `ACP_BACKENDS_STEER` (H6) | no | `_session/steer` is an extension it has not demonstrated |
+| `ACP_BACKENDS_ACP_RUNTIME` | no | runs through `AcpClient` (one process per session), not the demuxing `AcpRuntime`; this is also what keeps it out of the `cli.json` effort / Tool Search overlay, which is kiro-cli's own settings file |
+| `ACP_BACKENDS_KIRO_IDENTITY_STORE` | no | authenticates however its operator arranged; `kiro-cli logout` says nothing about it, and Kiro's API key is stripped from its environment |
+| `PROVIDER_LABEL_*` (H11) | `PROVIDER_LABEL_EXTERNAL` | without its own label an external session persists under the Kiro label and the map prunes its id for want of a Kiro transcript |
+
+Two consequences worth stating because they are easy to misread as gaps:
+
+- **Tool gating depends on the harness asking.** Crew's deny engine and approval
+  policy run on the `session/request_permission` path, so a harness that
+  executes a tool without requesting permission is not gated — the floor was
+  never consulted. That is true of every ACP harness including `kiro-cli`; what
+  differs is that declaring an interface is an operator's deliberate trust
+  grant, on the same footing as enabling a third-party app.
+- **Readiness is still computed from `kiro-cli`.** `KiroPrerequisiteService`
+  probes one binary (`--version`, `whoami`) and gates the gateway on it, so an
+  install whose crews all run elsewhere still reports not-ready without a
+  working `kiro-cli`. Making readiness per-interface is unbuilt.
 
 ## Adding or changing an invariant
 

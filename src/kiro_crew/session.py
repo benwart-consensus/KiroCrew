@@ -1829,6 +1829,11 @@ class SessionManager:
             ("_mcp_gateway_settings_mcp_json", "mcp_gateway_settings_mcp_json"),
             ("_mcp_gateway_socket", "mcp_gateway_socket"),
             ("backend", "acp_backend"),
+            # Without the command, a subagent of an EXTERNAL-backed parent
+            # inherits the backend id and nothing to launch, and fails
+            # provider construction. The backend and its argv are one fact and
+            # must travel together.
+            ("_acp_command", "acp_command"),
         ):
             val = getattr(client, attr, None)
             if val is not None:
@@ -2017,6 +2022,30 @@ class SessionManager:
             )
         except Exception:
             logger.debug("pool decision metric emit failed", exc_info=True)
+
+    def _pool_interface_mismatch(self, crew_agent: object) -> bool:
+        """True when this request's crew resolves to a different ACP interface.
+
+        The warm pool is filled with no crew identity (see ``_fill_warm_pool``),
+        so a pooled provider is only reusable by a crew that resolves to the SAME
+        interface the pool itself resolved to. ``_claim_from_pool`` compares the
+        kiro agent name, which does not distinguish two crews that share one
+        kiro_agent and bind different interfaces.
+
+        Fails CLOSED: any error resolving the interface bypasses the pool. A
+        needless rebuild costs a cold start; handing a crew the wrong harness
+        silently sends its prompts somewhere the operator did not choose.
+        """
+        try:
+            from kiro_crew.config.loader import resolve_acp_interface
+
+            pool_iface = resolve_acp_interface(self._cfg, self._pool_agent or None)
+            want = crew_agent if isinstance(crew_agent, str) and crew_agent else None
+            req_iface = resolve_acp_interface(self._cfg, want)
+            return req_iface.name != pool_iface.name
+        except Exception:
+            logger.debug("pool interface comparison failed; bypassing pool", exc_info=True)
+            return True
 
     def _claim_from_pool(self, agent: str | None) -> tuple[LLMProvider, float] | None:
         """Try to claim a pre-warmed provider if the agent matches.
@@ -2883,6 +2912,17 @@ class SessionManager:
             pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
+        elif self._pool_interface_mismatch(extra_factory_kwargs.get("crew_agent")):
+            # The pool is filled WITHOUT a crew identity, so every pooled
+            # provider carries whatever interface the pool's own resolution
+            # produced — and ``_claim_from_pool`` matches only on the KIRO agent
+            # name. Two crews can share one kiro_agent and bind different
+            # interfaces, so without this the claim hands an external-bound crew
+            # a kiro-cli provider and its prompts go to the wrong harness with
+            # nothing failing (GPT review on this PR). Bypass rather than filter,
+            # matching bypass_effort: the factory is the single authority on
+            # which harness a crew gets.
+            pool_decision = "bypass_interface"
         else:
             pool_decision = ""
         pooled = None if pool_decision else await self._drain_and_claim(agent)

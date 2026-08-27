@@ -2160,6 +2160,7 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             model=model,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
+            acp_interface=body.get("acp_interface", ""),
             source=body.get("source", "kirocrew"),
         )
         cfg.save()
@@ -2221,6 +2222,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "triggers" in body:
             agent.triggers = body["triggers"]
             changed.append("triggers")
+        if "acp_interface" in body:
+            # Not validated against the declared set here: an operator may bind a
+            # crew before declaring the interface, and resolution already degrades
+            # an unknown name to kiro-cli with a warning. Refusing the write would
+            # force a particular edit order for no safety gain.
+            agent.acp_interface = str(body["acp_interface"] or "")
+            changed.append("acp_interface")
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")

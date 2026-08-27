@@ -24,6 +24,7 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_EXTERNAL,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
@@ -33,6 +34,7 @@ from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
+    PROVIDER_LABEL_EXTERNAL,
     PROVIDER_LABEL_KAS,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
@@ -285,6 +287,8 @@ class AcpProvider(LLMProvider):
         channel_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
+        acp_command: list[str] | None = None,
+        acp_interface: str = "",
         effort_per_model: dict[str, str] | None = None,
         effort_defaults: object = None,
         tool_search: bool | None = None,
@@ -304,6 +308,15 @@ class AcpProvider(LLMProvider):
                 f"Unknown acp_backend {acp_backend!r}; "
                 f"expected one of {sorted(ACP_BACKENDS_KNOWN)}"
             )
+        # An external harness is defined BY its command — there is no binary the
+        # spawn path could fall back to resolving. Without this guard the empty
+        # argv would reach _spawn and surface as a dead session on the first
+        # message, so the config error must land here instead.
+        if acp_backend == ACP_BACKEND_EXTERNAL and not acp_command:
+            raise ValueError(
+                f"acp_backend {ACP_BACKEND_EXTERNAL!r} requires acp_command "
+                f"(interface {acp_interface or '?'!r} resolved to no launch command)"
+            )
         kwargs: dict[str, Any] = {
             "work_dir": work_dir,
             "model": model,
@@ -312,6 +325,7 @@ class AcpProvider(LLMProvider):
             "channel_id": channel_id,
             "extra_env": extra_env,
             "acp_backend": acp_backend,
+            "acp_command": acp_command,
             "mcp_gateway_overlay": mcp_gateway_overlay,
             "mcp_gateway_settings_mcp_json": mcp_gateway_settings_mcp_json,
             "mcp_gateway_socket": mcp_gateway_socket,
@@ -334,6 +348,10 @@ class AcpProvider(LLMProvider):
         # runtime so per-agent watchdog windows key off the crew, never off a
         # cross-namespace name match.
         self._crew_agent: str = crew_agent or ""
+        # The interface NAME that produced this provider. Kept for logs and
+        # diagnostics: ``backend`` says which dialect is spoken, which is not
+        # enough to tell two external harnesses apart when one of them misbehaves.
+        self._acp_interface: str = acp_interface
         # F2 load-recovery: set True by _start_kiro_runtime_impl when a resume
         # falls back to a FRESH native session (the prior session's lock never
         # cleared). Signals SessionManager.get_or_create to replay KiroCrew's
@@ -451,6 +469,18 @@ class AcpProvider(LLMProvider):
     def is_kas_backend(self) -> bool:
         """True when this ACP provider talks to KAS (kiro-agent)."""
         return self._client.backend == ACP_BACKEND_KAS
+
+    @property
+    def is_external_backend(self) -> bool:
+        """True when this ACP provider talks to an operator-declared harness.
+
+        Stated positively for the same reason as ``is_kiro_backend``: the sites
+        that mean "a harness Kiro Crew ships no support for" must say so, rather
+        than spelling it as ``not kiro and not claude`` — a pair of negations
+        that is correct with three backends and then silently captures the
+        fourth (harness-parity H5).
+        """
+        return self._client.backend == ACP_BACKEND_EXTERNAL
 
     @property
     def is_kiro_backend(self) -> bool:
@@ -950,11 +980,16 @@ class AcpProvider(LLMProvider):
     def _apply_effort_overlay(self) -> None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
 
-        No-op for the claude backend (it uses live set_config_option) and when
-        the model is not effort-capable or no level resolves. Called before
-        every (re)spawn so resume/restart keeps the same level.
+        Applies to the kiro family only (ACP_BACKENDS_ACP_RUNTIME): cli.json is
+        kiro-cli's own settings file. The claude backend uses live
+        set_config_option instead, and an external harness has no reason to read
+        a file it was never told about — stated as positive membership so a
+        harness added later does not inherit the write by not being claude
+        (harness-parity H5). Also a no-op when the model is not effort-capable or
+        no level resolves. Called before every (re)spawn so resume/restart keeps
+        the same level.
         """
-        if self.is_claude_backend:
+        if not self.is_acp_runtime_backend:
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -969,11 +1004,13 @@ class AcpProvider(LLMProvider):
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        No-op for the claude backend (Tool Search is a kiro-cli feature) and
-        when no toggle value was supplied (``self._tool_search is None``).
-        Called before every (re)spawn so resume/restart keeps the same setting.
+        Kiro family only (ACP_BACKENDS_ACP_RUNTIME) — Tool Search is a kiro-cli
+        feature and cli.json is its file, so membership is stated positively
+        rather than as "not claude" (harness-parity H5). Also a no-op when no
+        toggle value was supplied (``self._tool_search is None``). Called before
+        every (re)spawn so resume/restart keeps the same setting.
         """
-        if self.is_claude_backend or self._tool_search is None:
+        if not self.is_acp_runtime_backend or self._tool_search is None:
             return
         try:
             _write_tool_search_overlay(
@@ -1065,6 +1102,18 @@ class AcpProvider(LLMProvider):
         model = self._client._model
         if not model_supports_effort(model):
             logger.info("change_effort skipped — model %s does not support effort", model)
+            return False
+        # An external harness has neither mechanism this method uses: ``/effort``
+        # is a kiro-cli slash command and set_config_option is claude's. Report
+        # unsupported so the dashboard leaves the control alone, rather than
+        # sending one of them and having the harness fault mid-session. Tested
+        # positively (H5) — as a pair of negations this would also silently
+        # capture any backend added later.
+        if self.is_external_backend:
+            logger.info(
+                "change_effort skipped — interface %r exposes no effort control",
+                getattr(self, "_acp_interface", "") or self._client.backend,
+            )
             return False
         # Older claude-agent-acp builds advertise no 'effort' config option;
         # attempting to push would fail with 'Unknown config option' and reset
@@ -1184,19 +1233,32 @@ class AcpProvider(LLMProvider):
         """
         if self.is_acp_runtime_backend:
             return
-        level = self._resolve_effort()
-        if not level:
-            return
-        try:
-            await self._set_claude_effort(level)
-            logger.info("CC initial effort applied: model=%s effort=%s", self._client._model, level)
-        except Exception:
-            logger.warning(
-                "CC initial effort apply failed (model=%s effort=%s)",
-                self._client._model,
-                level,
-                exc_info=True,
-            )
+        # Scoped POSITIVELY to the backend whose mechanism this is: the push
+        # below is claude-agent-acp's own (session/set_config_option +
+        # settings.json). The kiro family already has effort from the cli.json
+        # overlay at spawn and returned above; an external harness has agreed to
+        # neither, and a stray set_config_option before its first prompt is a
+        # protocol error it would be right to reject. Written as `if claude`
+        # rather than `if not claude: return` so a backend added later is
+        # excluded by default instead of inheriting this push (harness-parity H5).
+        if self.is_claude_backend:
+            level = self._resolve_effort()
+            if not level:
+                return
+            try:
+                await self._set_claude_effort(level)
+                logger.info(
+                    "CC initial effort applied: model=%s effort=%s",
+                    self._client._model,
+                    level,
+                )
+            except Exception:
+                logger.warning(
+                    "CC initial effort apply failed (model=%s effort=%s)",
+                    self._client._model,
+                    level,
+                    exc_info=True,
+                )
 
     async def shutdown(self) -> None:
         await self._client.shutdown()
@@ -1511,4 +1573,6 @@ def provider_label(provider: Any) -> str:
         return PROVIDER_LABEL_CLAUDE
     if backend == ACP_BACKEND_KAS:
         return PROVIDER_LABEL_KAS
+    if backend == ACP_BACKEND_EXTERNAL:
+        return PROVIDER_LABEL_EXTERNAL
     return PROVIDER_LABEL_DEFAULT
